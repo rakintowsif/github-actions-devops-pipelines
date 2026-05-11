@@ -1,0 +1,157 @@
+name: KPI Sales CI/CD
+
+on:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: cs-kpi-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPO_CS_KPI }}
+
+jobs:
+  build-and-push-image:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
+      latest_tag: ${{ steps.latest.outputs.latest_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tag (short SHA)
+        id: meta
+        shell: bash
+        run: |
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Select branch-specific latest tag
+        id: latest
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "dev" ]; then
+            echo "LATEST_TAG=dev-latest" >> "$GITHUB_ENV"
+            echo "latest_tag=dev-latest" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_NAME}" = "staging" ]; then
+            echo "LATEST_TAG=staging-latest" >> "$GITHUB_ENV"
+            echo "latest_tag=staging-latest" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_NAME}" = "master" ]; then
+            echo "LATEST_TAG=prod-latest" >> "$GITHUB_ENV"
+            echo "latest_tag=prod-latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "LATEST_TAG=unknown" >> "$GITHUB_ENV"
+            echo "latest_tag=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.short_sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.LATEST_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+  deploy-to-production-with-docker:
+    name: Deploy to Production (Docker Compose)
+    needs: build-and-push-image
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH (docker-compose deployment)
+        uses: appleboy/ssh-action@v0.1.6
+        env:
+          REGION: ${{ env.AWS_REGION }}
+          REPO: ${{ env.ECR_REPOSITORY }}
+          SHORT_SHA: ${{ needs.build-and-push-image.outputs.short_sha }}
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          port: ${{ secrets.PORT }}
+          key: ${{ secrets.SSHKEY_PRIVATE }}
+          envs: REGION,REPO,SHORT_SHA
+          script: |
+            set -euo pipefail
+            cd /opt/cs-kpi
+
+            ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+            REGISTRY="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+
+            echo "Logging into ECR..."
+            aws ecr get-login-password --region "${REGION}" | docker login --username AWS --password-stdin "${REGISTRY}"
+
+            OLD_TAG=$(grep '^IMAGE_TAG_KPI=' .env | cut -d= -f2)
+            echo "Previous: ${OLD_TAG} → New: ${SHORT_SHA}"
+
+            sed -i "s|^IMAGE_TAG_KPI=.*|IMAGE_TAG_KPI=${SHORT_SHA}|" .env
+
+            docker compose pull cs-kpi
+            docker compose up -d cs-kpi
+
+            echo "Waiting for health check..."
+            HEALTHY=false
+            for i in {1..60}; do
+              if docker inspect --format='{{.State.Health.Status}}' cs-kpi-dkr-prod 2>/dev/null | grep -q "healthy"; then
+                echo "✅ Container healthy (${i}s)"
+                HEALTHY=true
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$HEALTHY" = "false" ]; then
+              echo "❌ Health check failed. Rolling back to ${OLD_TAG}..."
+
+              sed -i "s|^IMAGE_TAG_KPI=.*|IMAGE_TAG_KPI=${OLD_TAG}|" .env
+
+              docker compose pull cs-kpi
+              docker compose up -d cs-kpi
+              
+              for i in {1..30}; do
+                if docker inspect --format='{{.State.Health.Status}}' cs-kpi-dkr-prod 2>/dev/null | grep -q "healthy"; then
+                  echo "✅ Rollback successful"
+                  break
+                fi
+                sleep 2
+              done
+              
+              echo "❌ Deployment failed, rolled back to ${OLD_TAG}"
+              exit 1
+            fi
+
+            docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+
+            echo "Cleaning up old images..."
+            docker images --format "{{.ID}}\t{{.Repository}}:{{.Tag}}" | \
+              grep "cs-kpi-repo" | \
+              grep -v "${SHORT_SHA}" | \
+              grep -v "${OLD_TAG}" | \
+              awk '{print $1}' | \
+              xargs -r docker rmi -f 2>/dev/null || true
+
+            echo "Cleanup complete"
