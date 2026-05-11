@@ -1,0 +1,53 @@
+name: React Server Deployment
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy-to-production:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20.x]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: NPM Install
+        run: npm install
+
+      - name: Build Project
+        run: CI= npm run build
+
+      - name: SCP files via ssh key
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST_PRODUCTION }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSHKEY_PRIVATE }}
+          port: ${{ secrets.PORT }}
+          source: dist/
+          target: /home/ubuntu/cicd_front_production
+
+      - name: Deploy on Production Server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_PRODUCTION }}
+          username: ${{ secrets.USERNAME }}
+          port: ${{ secrets.PORT }}
+          key: ${{ secrets.SSHKEY_PRIVATE }}
+          script: |
+            cd /home/ubuntu/cicd_front_production
+            sudo cp -R dist/ /var/web/html_new/production_frontend
+            sudo chown -Rf nginx:cardselling /var/web/html_new/production_frontend
+            sudo chmod -Rf 770 /var/web/html_new/production_frontend
+            sudo chmod -Rf g+s /var/web/html_new/production_frontend
+            sudo systemctl reload nginx
