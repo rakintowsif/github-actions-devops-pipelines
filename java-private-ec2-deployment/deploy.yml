@@ -1,0 +1,40 @@
+name: Scheduler CI/CD
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy-to-scheduler-server:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via Bastion
+        uses: appleboy/ssh-action@v0.1.6
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.PORT }}
+
+          proxy_host: ${{ secrets.BASTION_HOST }}
+          proxy_username: ${{ secrets.BASTION_USER }}
+          proxy_key: ${{ secrets.BASTION_SSH_KEY }}
+          proxy_port: ${{ secrets.BASTION_PORT }}
+
+          script: |
+            set -e
+
+            echo "Pulling latest code..."
+            cd /var/web/html_new/Schedular-Cardselling-Core
+            git fetch origin
+            git reset --hard origin/master
+
+            echo "Deploying container..."
+            cd /opt/cs-core-scheduler
+            docker compose down
+            docker compose up -d --build
+
+            echo "Checking container..."
+            docker ps | grep cs-core-dkr-scheduler
